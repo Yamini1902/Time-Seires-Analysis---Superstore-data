@@ -1,0 +1,392 @@
+---
+title: 'Time Series Final Project : Superstore dataset'
+author: "Group 5"
+date: "2023-06-12"
+output: html_document
+---
+Loading libraries
+```{r}
+library(fpp3)
+library(tidyverse)
+library(dbplyr)
+library(fable)
+library(janitor)
+library(tseries)
+library(lubridate)
+library(tsibble)
+library(tidyverse)
+library(furrr)
+library(ggplot2)
+library(forecast)
+```
+
+Loading the dataset
+```{r}
+data <- read_csv("Data.csv")
+dim(data)
+str(data)
+```
+
+Cleaning up the variable names
+```{r}
+data <- clean_names(data)
+range(data$order_date)
+colnames(data)
+```
+
+```{r}
+
+data <- data %>%
+  mutate(order_date = ymd(order_date),
+         year = year(order_date),
+         month = month(order_date, label = TRUE))
+```
+
+Filtering "Furniture" for woking further on forecasting 
+```{r}
+
+fur <- data %>%
+  filter(category == 'Furniture')
+
+
+fur %>% 
+  arrange(order_date) %>% 
+  head(10)
+
+```
+
+```{r}
+furniture_clean <- 
+  fur %>% 
+  # arranging the data by date
+  arrange(order_date) %>% 
+  # adding up all the multiple observations
+  group_by(order_date) %>% 
+  summarise(sum(sales))
+
+furniture_clean$sales <- furniture_clean$`sum(sales)`
+
+furni_clean <- 
+  furniture_clean %>%  
+  # making the monthly time stamp
+  mutate(month_year = format(as.Date(furniture_clean$order_date), "%Y-%m"),
+         month_year = as.Date(paste(month_year, "-01", sep = ""))) %>% 
+  # arrange(order_date) %>% 
+  # enumerating the avearge daily sales per month
+  group_by(month_year) %>% 
+  summarise(sales = mean(sales))
+
+ggplot(data = furni_clean, aes(x = month_year, y = sales)) +
+  geom_point() +
+  geom_line()
+```
+
+```{r}
+furni2 <- furni_clean
+```
+
+Convert to tsibble
+```{r}
+
+furni2$month_year <- as.Date(furni2$month_year)
+furni_ts <- as_tsibble(furni2, key = NULL, index = month_year)
+
+furni_ts1 <- furni_ts |>
+  mutate(Month = yearmonth(month_year)) |>
+  as_tsibble(index = Month) 
+
+furni_ts1 %>% 
+  autoplot() + 
+  labs(title =
+         "Furniture sales over the years")
+```
+
+Decomposing the Time series
+```{r}
+
+fur_x11_dcmp <- furni_ts1 |>
+  model(x11 = X_13ARIMA_SEATS(sales ~ x11())) |>
+  components()
+autoplot(fur_x11_dcmp) +
+  labs(title =
+         "Decomposition of fruniture data of the superstore using X-11.")
+```
+
+```{r}
+fur_x11_dcmp %>%
+  gg_subseries()
+```
+
+checking the strength of the trend of the data
+```{r}
+furni_ts1 %>%
+  features(sales, feat_stl)
+```
+The features funtion show that data has strong seasonal pattern
+
+
+Checking the autocorrelation
+```{r}
+furni_ts1 |>
+  ACF(sales, lag_max = 48) |>
+  autoplot() + labs(title = "White noise for furniture data")
+
+```
+lag coefficients at 12 and 24 further validates a strong seasonal pattern in the data and the negative values observed at lags 5 and 7 indicate a consistent pattern of decreased sales at these intervals
+
+Transforming the data
+```{r}
+
+lambda_full <- furni_ts1 %>%
+  features(sales, features = guerrero) %>%
+  pull(lambda_guerrero)
+round(lambda_full,4)
+
+furni_ts1  |>
+  autoplot(box_cox(sales, lambda_full)) +
+  labs(y = "",
+       title = latex2exp::TeX(paste0(
+         "Transformed furniture sales with $\\lambda$ = ",
+         round(lambda_full,2))))
+
+```
+
+Diving the dataset into Train and Test
+```{r}
+furni_ts1_train <- furni_ts1 |>
+  slice(1:42)
+
+furni_ts1_test <- furni_ts1 |>
+  slice(43:48)
+```
+
+Fitting Basic models
+```{r}
+furni_fit_box <- furni_ts1_train %>%
+  model(
+    Mean = MEAN(box_cox(sales, lambda_full)),
+    Naive = NAIVE(box_cox(sales, lambda_full)),
+    SNaive = SNAIVE(box_cox(sales, lambda_full)),
+    TSLM = TSLM(box_cox(sales, lambda_full) ~ trend() + season()),
+    Drfit = RW(box_cox(sales, lambda_full) ~ drift()),
+    STLF = decomposition_model(
+      STL(box_cox(sales, lambda_full) ~ trend(window = 7), robust = TRUE),
+      NAIVE(season_adjust)
+    )
+  )
+```
+
+```{r}
+#Forecasting for all models
+furni_forecast_bx <- furni_fit_box %>%
+  forecast(h = 6)
+
+furni_forecast_bx %>%
+  fabletools::accuracy(furni_ts1_test)
+```
+
+Plot the forecast
+```{r}
+furni_forecast_bx |>
+  autoplot(furni_ts1, level = NULL) +
+  autolayer(
+    filter_index(furni_ts1, "2017 Jul" ~ .),
+    colour = "black"
+  ) +
+  labs(
+    y = "Sales",
+    title = "Forecasts for furniture sales"
+  ) +
+  guides(colour = guide_legend(title = "Forecast"))
+
+```
+
+Evaluating the residuals
+```{r}
+furni_LJ_bx <- augment(furni_fit_box) |> 
+  features(.resid, ljung_box, lag=12)
+```
+The Pvalue for SNaive, TSLM is >0.05, which confirms that there is White Noise.
+
+Check residual for SNaive 
+```{r}
+furni_ts1 %>%
+  model(SNaive = SNAIVE(box_cox(sales, lambda_full)),
+  ) %>%
+  gg_tsresiduals() +
+  labs(
+    title = "Residuals for Seasonal Naive")
+```
+From the basic models, SNaive is the best model for the data.
+
+Performing Exponential smoothing
+```{r}
+furni_fit_ES <- furni_ts1_train|>
+  model(
+    auto = ETS(sales),
+    ANN = ETS(sales ~ error("A") + trend("N") + season("N")),
+    additive = ETS(sales ~ error("A") + trend("A") +
+                     season("A")),
+    `Holt's method` = ETS(sales ~ error("A") +
+                            trend("A") + season("N")),
+    `Damped Holt's method` = ETS(sales ~ error("A") +
+                                   trend("Ad", phi = 0.9) + season("N"))
+  ) 
+```
+
+```{r}
+report(furni_fit_ES)
+```
+The AICc is lowest for Auto model
+
+Verifying the Residuals
+```{r}
+furni_LJ_ES <- augment(furni_fit_ES) |> 
+  features(.resid, ljung_box, lag=12)
+
+furni_LJ_ES
+```
+The Pvalue for Auto is  >0.05
+
+```{r}
+furni_fit_ES %>%
+  select(auto) %>%
+  gg_tsresiduals() +
+  labs(
+    title = "Residuals for Auto model of ES"
+  ) 
+```
+
+Forecasting for all ETS models
+```{r}
+furni_forecast_ES <- furni_fit_ES %>%
+  forecast(h = 6) %>%
+  autoplot(furni_ts1) +
+  labs(y= "Sales", title="furniture forecast for ETS") +
+  guides(colour = "none")
+
+furni_forecast_ES
+```
+
+Checking the accuracy
+```{r}
+
+furni_forecast_ES <- furni_fit_ES %>%
+  forecast(h = 6) %>%
+  fabletools::accuracy(furni_ts1_test)
+
+furni_forecast_ES
+```
+Auto model has lowest MAPE and thus better forecasting model for Exponential smoothing technique 
+
+Performing ARIMA
+Check for stationary in time series
+```{r}
+furni_ts1_train %>% features(sales, unitroot_kpss)
+
+```
+The p value is 0.10 which is greater than 0.05 and thus we accept the null hypothesis. The data is stationary.
+
+Verfiying the above using ADF test 
+```{r}
+furni_ts1_train %>% 
+  features(sales, unitroot_ndiffs)
+```
+ndiffs is 0 which validates that the data is stationary and no differencing is needed
+
+Check for seasonal differencing
+```{r}
+furni_ts1_train %>% 
+  features(sales, unitroot_nsdiffs)
+```
+nsdiffs is 1 and thus 1 seasonal difference is needed
+
+```{r}
+furni_ts1_train |>
+  mutate(sales_diff = difference((sales), 12)) |>
+  features(sales_diff, unitroot_kpss)
+```
+The p value is 0.1 which is greater than 0.05 and thus we accept null hypothesis. The data is stationary.
+
+```{r}
+furni_ts1_train_stat <- furni_ts1_train |>
+  mutate(sales_diff = difference((sales), 12))
+```
+
+Identify a couple of ARIMA models is the best according to their AICc values?
+```{r}
+furni_ts1_train_stat %>% gg_tsdisplay(sales_diff, plot_type = "partial",lag=36) + 
+  labs(title="ACF and PACF for ARIMA Models") +
+  guides(colour = "none")
+```
+
+fit the models
+```{r}
+furni_ar_fit <- furni_ts1_train_stat %>%
+  model(arima100100 = ARIMA(sales ~ pdq(1,0,0) 
+                            + PDQ(1,0,0)), 
+        arima111110 = ARIMA(sales ~ pdq(1,1,1) 
+                            + PDQ(1,1,0)),
+        arima000110 = ARIMA(sales ~ pdq(0,0,0) 
+                            + PDQ(1,1,0)),
+        auto = ARIMA(sales, stepwise = FALSE, approx = FALSE)
+  )
+```
+
+```{r}
+glance(furni_ar_fit)
+```
+The model with lowest AICc - arima111110, verifying with ljung_box test
+
+```{r}
+arima_final <- furni_ts1_train_stat %>%
+  model(arima111110 = ARIMA(sales ~ pdq(1,1,1) 
+                            + PDQ(1,1,0)))
+
+augment(arima_final) %>%
+  features(.innov, ljung_box, lag = 12, dof=4)
+
+```
+
+```{r}
+arima_final %>%
+  gg_tsresiduals(lag=36) +
+  labs(title="Residuals for ARIMA model") 
+```
+
+forecasting for all Arima model 
+```{r}
+furni_ar_fit_fc1<- furni_ar_fit %>%
+  forecast(h = 6) %>%
+  autoplot(furni_ts1) +
+  labs(title="Forecasting for all ARIMA models") 
+
+furni_ar_fit_fc1
+```
+
+Final Conclusion: 
+check the final model of ARIMA and ES
+```{r}
+final_check <- furni_ts1_train %>%
+  model(arima111110 = ARIMA(sales ~ pdq(1,1,1) 
+                            + PDQ(1,1,0)),
+        ETS = ETS(sales)
+        )
+```
+
+```{r}
+glance(final_check)
+```
+As per AICc, ARIMA 111110 is the best model
+
+Forecasting for final models 
+```{r}
+final_check_fc <- final_check %>%
+  forecast(h = 6) %>%
+  autoplot(furni_ts1) +
+  labs(title="Forecasting using ETS V/s ARIMA") 
+
+final_check_fc
+```
+Based on the analysis and comparison between Exponential Smoothing (ES) and ARIMA models for the furniture sales time series data, the ARIMA(1,1,1)(1,1,0)[12] model emerges as the most suitable choice. 
+
